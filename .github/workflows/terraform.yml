@@ -1,0 +1,339 @@
+# =============================================================================
+# terraform.yml — validate / plan / dispatch-only apply for tgt-documentdb
+# =============================================================================
+#
+# Mirror of tgt-rds-postgres/.github/workflows/terraform.yml. Same HARD RULE
+# applies: apply runs ONLY on workflow_dispatch (the dispatch IS the gate).
+# Push-to-main runs validate + plan only — never auto-applies.
+#
+# Per HARD RULE feedback_manual_apply_no_auto_approval (post-2026-05-15):
+# Only the USER clicks "Run workflow" in the GitHub UI. Claude prepares
+# everything (PR merged, plan green) then asks the user to dispatch.
+# Claude must NEVER call github_trigger_workflow with action=apply.
+#
+# Auth: GitHub OIDC → IAM role tgt-github-actions (trust policy already
+# wildcarded to repo:dkeeno/tgt-*:*, no per-repo update needed).
+
+name: terraform
+
+on:
+  pull_request:
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - 'seed/**'
+      - '.github/workflows/terraform.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - 'seed/**'
+      - '.github/workflows/terraform.yml'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Apply or Destroy
+        type: choice
+        required: true
+        default: apply
+        options: [apply, destroy]
+
+permissions:
+  contents: read
+  id-token: write       # OIDC token for AWS auth
+  pull-requests: write  # PR comment with plan output
+
+env:
+  TF_VERSION: '1.10.3'
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # validate — runs on EVERY trigger (PR, push, dispatch).
+  # On workflow_dispatch this gives a connected graph: validate → plan →
+  # apply → seed all flow green in one run instead of two disconnected
+  # experiences (one greyed plan run + one greyed apply run).
+  # ---------------------------------------------------------------------------
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Format check
+        run: terraform fmt -check -recursive
+
+      - name: Init (no backend — validate-only)
+        run: terraform init -backend=false
+
+      - name: Validate
+        run: terraform validate
+
+  # ---------------------------------------------------------------------------
+  # plan — runs on every trigger. PR comment with diff still posts only
+  # on pull_request events (see the script step's own `if`).
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tf-plan-${{ github.run_id }}
+
+      - name: Init
+        run: terraform init
+
+      - name: Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan-output.txt
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: |
+            tfplan
+            plan-output.txt
+          retention-days: 14
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let plan = fs.readFileSync('plan-output.txt', 'utf8');
+            if (plan.length > 60000) plan = plan.slice(0, 60000) + '\n\n... (truncated)';
+            const body = `### terraform plan\n\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n\n</details>`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Fail if plan errored
+        if: steps.plan.outputs.exit != '0' && steps.plan.outputs.exit != '2'
+        run: exit 1
+
+  # ---------------------------------------------------------------------------
+  # apply — runs on push-to-main AND on workflow_dispatch (action=apply).
+  # `environment: production` triggers the GitHub Environment review gate:
+  # the run pauses with a "Review deployments → Approve" button. The user
+  # clicks Approve to release apply. This is the manual gate.
+  # ---------------------------------------------------------------------------
+  apply:
+    name: apply
+    runs-on: ubuntu-latest
+    needs: plan
+    environment: production
+    if: |
+      needs.plan.result == 'success'
+      && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
+      )
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tf-apply-${{ github.run_id }}
+
+      - name: Init
+        run: terraform init
+
+      - name: Apply (fresh plan + apply on dispatch)
+        run: terraform apply -auto-approve
+
+      - name: Capture outputs
+        run: terraform output -json > terraform-outputs.json
+
+      - name: Upload outputs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs-${{ github.run_id }}
+          path: terraform-outputs.json
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # seed — runs after apply succeeds. Pushes seed bundle to bastion via
+  #        SSM SendCommand and runs mongosh against DocumentDB.
+  # ---------------------------------------------------------------------------
+  seed:
+    name: seed
+    runs-on: ubuntu-latest
+    needs: apply
+    environment: production # second click gate — seed loads data, treat like apply
+    if: needs.apply.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tf-seed-${{ github.run_id }}
+
+      - name: Look up runtime values
+        id: lookup
+        run: |
+          BASTION_ID=$(aws ec2 describe-instances \
+            --filters Name=tag:Name,Values=tgt-bastion-01 Name=instance-state-name,Values=running \
+            --query "Reservations[0].Instances[0].InstanceId" --output text)
+          STATE_BUCKET="tgt-tfstate-${{ vars.AWS_ACCOUNT_ID }}-${{ env.AWS_REGION }}"
+          SECRET_ARN=$(aws secretsmanager describe-secret \
+            --secret-id tgt-docdb-master-credentials \
+            --query ARN --output text)
+          DOCDB_HOST=$(aws docdb describe-db-clusters \
+            --db-cluster-identifier tgt-docdb \
+            --query "DBClusters[0].Endpoint" --output text)
+
+          echo "bastion_id=$BASTION_ID"     >> "$GITHUB_OUTPUT"
+          echo "state_bucket=$STATE_BUCKET" >> "$GITHUB_OUTPUT"
+          echo "secret_arn=$SECRET_ARN"     >> "$GITHUB_OUTPUT"
+          echo "docdb_host=$DOCDB_HOST"     >> "$GITHUB_OUTPUT"
+
+          echo "Bastion:     $BASTION_ID"
+          echo "State bkt:   $STATE_BUCKET"
+          echo "Secret ARN:  $SECRET_ARN"
+          echo "DocDB host:  $DOCDB_HOST"
+
+      - name: Upload seed bundle to S3 (transient drop zone)
+        run: |
+          aws s3 cp seed/ \
+            "s3://${{ steps.lookup.outputs.state_bucket }}/seed-drops/tgt-docdb-${{ github.run_id }}/" \
+            --recursive --exclude "*" --include "*.js" --include "run-seed.sh"
+
+      - name: Run seed on bastion via SSM SendCommand
+        id: ssm
+        run: |
+          DROP_S3="s3://${{ steps.lookup.outputs.state_bucket }}/seed-drops/tgt-docdb-${{ github.run_id }}/"
+          REMOTE_DIR="/tmp/tgt-docdb-seed-${{ github.run_id }}"
+
+          jq -n \
+            --arg drop "$DROP_S3" \
+            --arg remote "$REMOTE_DIR" \
+            --arg secret "${{ steps.lookup.outputs.secret_arn }}" \
+            --arg region "${{ env.AWS_REGION }}" \
+            --arg host "${{ steps.lookup.outputs.docdb_host }}" \
+            '{
+              commands: [
+                "set -e",
+                "rm -rf \($remote) && mkdir -p \($remote)",
+                "aws s3 cp \($drop) \($remote)/ --recursive --quiet",
+                "chmod +x \($remote)/run-seed.sh",
+                "export DOCDB_HOST=\($host) SECRET_ARN=\($secret) AWS_REGION=\($region) SEED_DROP=\($remote)",
+                "bash \($remote)/run-seed.sh",
+                "rm -rf \($remote)"
+              ],
+              executionTimeout: ["1500"]
+            }' > /tmp/ssm-params.json
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ steps.lookup.outputs.bastion_id }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "tgt-docdb seed run-id ${{ github.run_id }}" \
+            --parameters file:///tmp/ssm-params.json \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
+            --query "Command.CommandId" --output text)
+          echo "SSM Command ID: $CMD_ID"
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+
+          for i in $(seq 1 75); do
+            sleep 20
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "${{ steps.lookup.outputs.bastion_id }}" \
+              --query Status --output text 2>/dev/null || echo "Pending")
+            echo "[t+$((i*20))s] status: $STATUS"
+            case "$STATUS" in
+              Success) exit 0 ;;
+              Cancelled|Failed|TimedOut) echo "::error::Seed run failed: $STATUS"; exit 1 ;;
+            esac
+          done
+          echo "::error::Seed run did not complete within 25min"
+          exit 1
+
+      - name: Print SSM stdout + stderr
+        if: always()
+        run: |
+          echo "===== SSM stdout ====="
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${{ steps.lookup.outputs.bastion_id }}" \
+            --query StandardOutputContent --output text || true
+          echo ""
+          echo "===== SSM stderr ====="
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${{ steps.lookup.outputs.bastion_id }}" \
+            --query StandardErrorContent --output text || true
+
+      - name: Cleanup S3 drop zone
+        if: always()
+        run: |
+          aws s3 rm \
+            "s3://${{ steps.lookup.outputs.state_bucket }}/seed-drops/tgt-docdb-${{ github.run_id }}/" \
+            --recursive --quiet || true
+
+  # ---------------------------------------------------------------------------
+  # destroy — workflow_dispatch only
+  # ---------------------------------------------------------------------------
+  # `needs: plan` here too keeps the graph connected. always() lets it run
+  # even when plan was skipped (which it always is on workflow_dispatch).
+  destroy:
+    name: destroy
+    runs-on: ubuntu-latest
+    needs: plan
+    if: |
+      github.event_name == 'workflow_dispatch'
+      && inputs.action == 'destroy'
+      && needs.plan.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tf-destroy-${{ github.run_id }}
+
+      - name: Init
+        run: terraform init
+
+      - name: Destroy
+        run: terraform destroy -auto-approve
