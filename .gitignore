@@ -1,0 +1,16 @@
+# Terraform local artifacts — HARD RULE feedback_no_terraform_artifacts:
+# .terraform/ AND .terraform.lock.hcl are EXCLUDED from version control.
+.terraform/
+.terraform.lock.hcl
+
+*.tfplan
+*.tfstate
+*.tfstate.backup
+*.auto.tfvars
+override.tf
+override.tf.json
+
+# CA bundle downloaded for mongosh TLS
+global-bundle.pem
+
+.DS_Store
