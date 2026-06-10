@@ -7,9 +7,9 @@
 # Push-to-main runs validate + plan only — never auto-applies.
 #
 # Per HARD RULE feedback_manual_apply_no_auto_approval (post-2026-05-15):
-# Only the USER clicks "Run workflow" in the GitHub UI. Claude prepares
+# Only the USER clicks "Run workflow" in the GitHub UI. the operator prepares
 # everything (PR merged, plan green) then asks the user to dispatch.
-# Claude must NEVER call github_trigger_workflow with action=apply.
+# The operator must NEVER call github_trigger_workflow with action=apply.
 #
 # Auth: GitHub OIDC → IAM role tgt-github-actions (trust policy already
 # wildcarded to repo:dkeeno/tgt-*:*, no per-repo update needed).
